@@ -1,0 +1,10 @@
+# Ignore large cleaned and raw dataset folders
+clean/
+cleaned_data/
+data/
+*.csv
+
+# Ignore Python environment & cache files
+__pycache__/
+venv/
+.env
