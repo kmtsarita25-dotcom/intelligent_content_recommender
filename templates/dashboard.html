@@ -1,90 +1,99 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Capstone 10 | Intelligent Learning & Drift-Aware Recommender</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PathWise | OULAD Sequential &amp; Drift Recommendation Engine</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
-
 <body>
     <header class="topbar">
         <div class="brand">
-            <h1>Adaptive Learning Hub</h1>
-            <span class="badge">Drift-Aware Graph &amp; XAI Engine</span>
+            <h1>PathWise</h1>
+            <span class="pill-badge">OULAD Real-Data Engine</span>
         </div>
+
         <form id="student-controls" class="controls">
-            <label for="student-id">Student ID</label>
-            <input type="number" id="student-id" name="id_student" value="101" min="1" required />
-
-            <label for="active-site">Active Module ID</label>
-            <input type="number" id="active-site" name="active_id_site" value="12" min="1" required />
-
-            <label for="decay-lambda">Decay (&lambda;)</label>
-            <input type="number" id="decay-lambda" name="decay_weight" value="0.15" step="0.05" min="0.01" max="2.0" />
-
-            <button type="submit" id="refresh-btn">Update Feed</button>
+            <label>
+                Sample OULAD IDs
+                <select id="sample-student-select">
+                    <option value="">-- Quick Pick --</option>
+                </select>
+            </label>
+            <label>
+                Student ID
+                <input type="number" id="student-id" value="{{ default_student_id }}" required>
+            </label>
+            <label>
+                Override Site ID (Optional)
+                <input type="number" id="active-site" placeholder="Auto (Latest)">
+            </label>
+            <label>
+                Decay (&lambda;)
+                <input type="number" id="decay-lambda" step="0.01" min="0.001" max="1" value="0.03" required>
+            </label>
+            <button type="submit" class="btn-primary">Update Feed</button>
         </form>
     </header>
 
-    <main class="container">
-        <!-- Status / Toast Banner -->
-        <div id="status-banner" class="status-banner hidden" role="status"></div>
+    <main class="dashboard">
+        <div id="status-banner" class="banner hidden"></div>
 
-        <!-- KPI Summary Strip -->
-        <section class="kpi-grid" aria-label="Student Engagement Summary">
+        <!-- Real OULAD KPI Cards -->
+        <section class="kpi-row">
             <div class="kpi-card">
-                <span class="kpi-label">Active Student</span>
-                <strong id="kpi-student">#101</strong>
+                <span class="kpi-label">OULAD Student &amp; Module</span>
+                <strong class="kpi-value" id="kpi-student">#{{ default_student_id }}</strong>
+                <span class="kpi-sub" id="kpi-profile">Loading profile...</span>
             </div>
             <div class="kpi-card">
-                <span class="kpi-label">Weekly Interactions</span>
-                <strong id="kpi-clicks">--</strong>
+                <span class="kpi-label">Total Recorded Clicks</span>
+                <strong class="kpi-value" id="kpi-clicks">--</strong>
+                <span class="kpi-sub" id="kpi-weeks">Across -- active weeks</span>
             </div>
             <div class="kpi-card">
-                <span class="kpi-label">Dominant Topic Shift</span>
-                <strong id="kpi-topic">--</strong>
+                <span class="kpi-label">Dominant Activity Type (Decayed)</span>
+                <strong class="kpi-value accent-blue" id="kpi-topic">--</strong>
+                <span class="kpi-sub">Highest w = c &middot; e<sup>-&lambda;&Delta;t</sup> weight</span>
             </div>
             <div class="kpi-card">
-                <span class="kpi-label">Avg Drift Confidence</span>
-                <strong id="kpi-score">--</strong>
+                <span class="kpi-label">Avg Recommendation Confidence</span>
+                <strong class="kpi-value accent-green" id="kpi-score">--</strong>
+                <span class="kpi-sub">Top-3 ranked OULAD materials</span>
             </div>
         </section>
 
-        <!-- Active Session + Up Next Recommendations -->
+        <!-- Two-Column Workspace: Active OULAD Session + Up Next Recommendations -->
         <section class="main-grid">
-            <!-- Active Session Card -->
-            <article class="panel active-panel">
+            <div class="panel">
                 <div class="panel-header">
-                    <h2>Active Session</h2>
-                    <span class="pill pill-live">In Progress</span>
+                    <h2>Latest Recorded OULAD Interaction</h2>
+                    <span class="tag-amber">Active Node</span>
                 </div>
                 <div id="active-session-card" class="session-box">
-                    <p class="muted">Loading current study module...</p>
+                    <p class="muted">Querying student_vle_logs...</p>
                 </div>
-            </article>
+            </div>
 
-            <!-- Up Next + Why This? Cards -->
-            <article class="panel recs-panel">
+            <div class="panel">
                 <div class="panel-header">
-                    <h2>Up Next (Top Sequential &amp; Drift-Ranked Items)</h2>
-                    <span class="pill pill-xai">XAI Explained</span>
+                    <h2>Up Next (Sequential Graph &amp; Drift-Ranked OULAD Sites)</h2>
+                    <span class="tag-green">XAI Explained</span>
                 </div>
-                <div id="recommendations-list" class="cards-stack">
-                    <p class="muted">Fetching personalized recommendations...</p>
+                <div id="recommendations-list" class="rec-list">
+                    <p class="muted">Computing next-step recommendations...</p>
                 </div>
-            </article>
+            </div>
         </section>
 
-        <!-- Interest Shift / Drift Graph -->
+        <!-- Real OULAD Temporal Drift Chart -->
         <section class="panel chart-panel">
             <div class="panel-header">
-                <h2>Preference Drift &amp; Weekly Engagement Over Time</h2>
-                <span class="muted">Exponential Time-Decay (w = e<sup>-&lambda;&Delta;t</sup>) Topic Weighting</span>
+                <h2>OULAD Weekly Activity Drift Over Course Timeline</h2>
+                <span class="muted">Normalized Time-Decayed Interest Weight (w = c &middot; e<sup>-&lambda;&Delta;t</sup>)</span>
             </div>
-            <div class="chart-wrapper">
+            <div class="chart-box">
                 <canvas id="driftChart"></canvas>
             </div>
         </section>
@@ -92,5 +101,4 @@
 
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
 </body>
-
 </html>

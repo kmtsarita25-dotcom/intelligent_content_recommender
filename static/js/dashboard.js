@@ -1,9 +1,3 @@
-/**
- * Capstone 10 - Member 4 Frontend Controller
- * Connects Active Session, Up Next + "Why this?" cards, /api/track clickstream,
- * and /api/analytics/<id_student> Chart.js drift visualization.
- */
-
 let driftChartInstance = null;
 
 function showBanner(message, isError = false) {
@@ -11,122 +5,93 @@ function showBanner(message, isError = false) {
     banner.textContent = message;
     banner.style.borderColor = isError ? "#ef4444" : "#3b82f6";
     banner.classList.remove("hidden");
-    setTimeout(() => banner.classList.add("hidden"), 3500);
+    setTimeout(() => banner.classList.add("hidden"), 4000);
 }
 
-/**
- * Fetches recommendations from Flask backend.
- */
+async function populateSampleStudents() {
+    try {
+        const res = await fetch("/api/sample-students");
+        if (!res.ok) return;
+        const students = await res.json();
+        const select = document.getElementById("sample-student-select");
+        students.forEach((s) => {
+            const opt = document.createElement("option");
+            opt.value = s.id_student;
+            opt.textContent = `#${s.id_student} (${s.code_module} • ${s.final_result})`;
+            select.appendChild(opt);
+        });
+
+        select.addEventListener("change", () => {
+            if (select.value) {
+                document.getElementById("student-id").value = select.value;
+                document.getElementById("active-site").value = "";
+                loadDashboard();
+            }
+        });
+    } catch (err) {
+        console.error("Failed to load sample student IDs:", err);
+    }
+}
+
 async function fetchRecommendations(studentId, activeSiteId, decayWeight) {
     const params = new URLSearchParams({
         id_student: studentId,
-        active_id_site: activeSiteId,
         decay_weight: decayWeight,
     });
-
-    try {
-        const res = await fetch(`/api/recommend?${params.toString()}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return await res.json();
-    } catch (err) {
-        console.warn("Using fallback recommendation payload:", err);
-        return {
-            active_session: {
-                id_site: Number(activeSiteId),
-                title: `Module #${activeSiteId}: Core Data Structures & Traversal`,
-                topic: "Algorithms & Graphs",
-                progress: "72% Completed",
-            },
-            recommendations: [{
-                    id_site: Number(activeSiteId) + 1,
-                    title: "BFS & DFS Prerequisite Graph Traversal",
-                    topic: "Graph Theory",
-                    drift_score: 0.94,
-                    why_this: `Direct prerequisite after Module #${activeSiteId} + high recent focus`,
-                },
-                {
-                    id_site: Number(activeSiteId) + 4,
-                    title: "TF-IDF Vectorization & Cosine Similarity",
-                    topic: "Applied NLP",
-                    drift_score: 0.87,
-                    why_this: "Matches your recent 48h shift toward Information Retrieval",
-                },
-                {
-                    id_site: Number(activeSiteId) + 7,
-                    title: "Exponential Time-Decay Modeling",
-                    topic: "Machine Learning",
-                    drift_score: 0.82,
-                    why_this: "Trending in your recent session queue (decay weight active)",
-                },
-            ],
-        };
+    if (activeSiteId) {
+        params.set("active_id_site", activeSiteId);
     }
+
+    const res = await fetch(`/api/recommend?${params.toString()}`);
+    const data = await res.json();
+    if (!res.ok) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    return data;
 }
 
-/**
- * Fetches student analytics & preference drift time series from Member 3's endpoint.
- */
-async function fetchAnalytics(studentId) {
-    try {
-        const res = await fetch(`/api/analytics/${studentId}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return await res.json();
-    } catch (err) {
-        console.warn("Using fallback analytics payload:", err);
-        return {
-            id_student: Number(studentId),
-            weekly_clicks: 38,
-            dominant_topic: "Graph Theory & NLP",
-            timeline: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-            topic_series: [{
-                    label: "Graph Algorithms (Current Shift)",
-                    data: [0.32, 0.41, 0.55, 0.68, 0.79, 0.88, 0.94],
-                    borderColor: "#3b82f6",
-                },
-                {
-                    label: "Applied NLP / TF-IDF",
-                    data: [0.25, 0.30, 0.48, 0.62, 0.74, 0.81, 0.87],
-                    borderColor: "#10b981",
-                },
-                {
-                    label: "Basic SQL Queries (Decaying)",
-                    data: [0.85, 0.72, 0.60, 0.47, 0.35, 0.26, 0.19],
-                    borderColor: "#f59e0b",
-                },
-            ],
-        };
+async function fetchAnalytics(studentId, decayWeight) {
+    const res = await fetch(`/api/analytics/${studentId}?decay_weight=${decayWeight}`);
+    const data = await res.json();
+    if (!res.ok) {
+        throw new Error(data.error || `HTTP ${res.status}`);
     }
+    return data;
 }
 
-/**
- * Sends live click tracking event to /api/track (Member 3) and updates active module.
- */
 async function trackClickAndOpen(studentId, clickedItem) {
     try {
-        await fetch("/api/track", {
+        const res = await fetch("/api/track", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 id_student: Number(studentId),
                 id_site: Number(clickedItem.id_site),
-                timestamp: new Date().toISOString(),
             }),
         });
+        if (!res.ok) throw new Error("Failed to write click to MySQL");
     } catch (err) {
-        console.warn("Offline click track simulated:", err);
+        showBanner(`Database error logging click: ${err.message}`, true);
+        return;
     }
 
     document.getElementById("active-site").value = clickedItem.id_site;
-    showBanner(`Tracked click on "${clickedItem.title}" (ID #${clickedItem.id_site}) — updating drift weights...`);
+    showBanner(`Logged real click on OULAD Site #${clickedItem.id_site} (${clickedItem.activity_type}) — recalculating drift...`);
     await loadDashboard();
 }
 
-function renderActiveSession(session) {
+function renderActiveSession(session, profile) {
     const container = document.getElementById("active-session-card");
+    const modInfo = profile
+        ? `Module ${profile.code_module} (${profile.code_presentation}) &bull; Result: ${profile.final_result}`
+        : `Module ${session.code_module} (${session.code_presentation})`;
+
+    document.getElementById("kpi-profile").innerHTML = modInfo;
+
     container.innerHTML = `
-        <h3>${session.title || `Module #${session.id_site}`}</h3>
-        <p class="rec-meta">Site ID: #${session.id_site} &bull; Topic: <strong>${session.topic || "General"}</strong></p>
-        <p class="muted">${session.progress || "Active study session in progress. Completing this unlocks downstream prerequisite nodes."}</p>
+        <h3>OULAD Site #${session.id_site} &mdash; ${session.activity_type.toUpperCase()}</h3>
+        <p class="rec-meta">Module: <strong>${session.code_module}</strong> &bull; Scheduled: <strong>Week ${session.week_from} to Week ${session.week_to}</strong></p>
+        <p class="muted">Last recorded click on course day <strong>${session.latest_day}</strong> (${session.visited_count} distinct materials visited in recent window).</p>
     `;
 }
 
@@ -135,25 +100,26 @@ function renderRecommendations(studentId, recs) {
     list.innerHTML = "";
 
     if (!recs || recs.length === 0) {
-        list.innerHTML = `<p class="muted">No sequential recommendations available for this module.</p>`;
+        list.innerHTML = `<p class="muted">No remaining unvisited OULAD materials found after this week.</p>`;
+        document.getElementById("kpi-score").textContent = "--";
         return;
     }
 
     let totalScore = 0;
 
     recs.forEach((item) => {
-        const score = Number(item.drift_score ?? item.score ?? 0);
+        const score = Number(item.drift_score || 0);
         totalScore += score;
 
         const card = document.createElement("div");
         card.className = "rec-card";
         card.innerHTML = `
             <div>
-                <strong>${item.title || `Study Module #${item.id_site}`}</strong>
+                <strong>OULAD Site #${item.id_site} (${item.activity_type.toUpperCase()})</strong>
                 <div class="rec-meta">
-                    Site ID: #${item.id_site} &bull; Topic: ${item.topic || "Core Module"} &bull; Drift Score: <strong>${score.toFixed(2)}</strong>
+                    Module: ${item.code_module} &bull; Week ${item.week_from} &bull; Engine: ${item.source_rule} &bull; Score: <strong>${score.toFixed(2)}</strong>
                 </div>
-                <span class="why-tag">Why this? ${item.why_this || "Sequential prerequisite & recent interest match"}</span>
+                <span class="why-tag">Why this? ${item.why_this}</span>
             </div>
             <button type="button" class="launch-btn">Study Next &rarr;</button>
         `;
@@ -165,8 +131,7 @@ function renderRecommendations(studentId, recs) {
         list.appendChild(card);
     });
 
-    const avgScore = totalScore / recs.length;
-    document.getElementById("kpi-score").textContent = avgScore.toFixed(2);
+    document.getElementById("kpi-score").textContent = (totalScore / recs.length).toFixed(2);
 }
 
 function renderDriftChart(analytics) {
@@ -183,7 +148,7 @@ function renderDriftChart(analytics) {
         backgroundColor: "transparent",
         tension: 0.35,
         borderWidth: 2.5,
-        pointRadius: 4,
+        pointRadius: 3.5,
     }));
 
     driftChartInstance = new Chart(ctx, {
@@ -201,18 +166,18 @@ function renderDriftChart(analytics) {
             scales: {
                 x: {
                     ticks: { color: "#94a3b8" },
-                    grid: { color: "#334155" },
+                    grid: { color: "#1e293b" },
                 },
                 y: {
                     min: 0,
                     max: 1,
                     title: {
                         display: true,
-                        text: "Time-Decayed Interest Weight",
+                        text: "Normalized Time-Decayed Click Weight",
                         color: "#94a3b8",
                     },
                     ticks: { color: "#94a3b8" },
-                    grid: { color: "#334155" },
+                    grid: { color: "#1e293b" },
                 },
             },
         },
@@ -226,17 +191,28 @@ async function loadDashboard() {
 
     document.getElementById("kpi-student").textContent = `#${studentId}`;
 
-    const [recPayload, analyticsPayload] = await Promise.all([
-        fetchRecommendations(studentId, activeSiteId, decayWeight),
-        fetchAnalytics(studentId),
-    ]);
+    try {
+        const [recPayload, analyticsPayload] = await Promise.all([
+            fetchRecommendations(studentId, activeSiteId, decayWeight),
+            fetchAnalytics(studentId, decayWeight),
+        ]);
 
-    renderActiveSession(recPayload.active_session || { id_site: activeSiteId });
-    renderRecommendations(studentId, recPayload.recommendations || []);
+        renderActiveSession(recPayload.active_session, recPayload.student_profile);
+        renderRecommendations(studentId, recPayload.recommendations);
 
-    document.getElementById("kpi-clicks").textContent = analyticsPayload.weekly_clicks ?? "--";
-    document.getElementById("kpi-topic").textContent = analyticsPayload.dominant_topic ?? "--";
-    renderDriftChart(analyticsPayload);
+        document.getElementById("kpi-clicks").textContent = (analyticsPayload.total_clicks ?? 0).toLocaleString();
+        document.getElementById("kpi-weeks").textContent = `Across ${analyticsPayload.active_weeks ?? 0} active study weeks`;
+        document.getElementById("kpi-topic").textContent = (analyticsPayload.dominant_activity || "--").toUpperCase();
+
+        renderDriftChart(analyticsPayload);
+    } catch (err) {
+        showBanner(err.message, true);
+        document.getElementById("active-session-card").innerHTML = `<p class="muted">${err.message}</p>`;
+        document.getElementById("recommendations-list").innerHTML = "";
+        document.getElementById("kpi-clicks").textContent = "--";
+        document.getElementById("kpi-topic").textContent = "--";
+        document.getElementById("kpi-score").textContent = "--";
+    }
 }
 
 document.getElementById("student-controls").addEventListener("submit", async (e) => {
@@ -244,4 +220,7 @@ document.getElementById("student-controls").addEventListener("submit", async (e)
     await loadDashboard();
 });
 
-document.addEventListener("DOMContentLoaded", loadDashboard);
+document.addEventListener("DOMContentLoaded", async () => {
+    await populateSampleStudents();
+    await loadDashboard();
+});

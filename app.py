@@ -1,5 +1,5 @@
 import os
-from collections import deque
+import math
 from functools import wraps
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
@@ -9,7 +9,6 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# 1. Persistent MySQL Connection Pool (reuses open connections instead of reconnecting per request)
 db_pool = pooling.MySQLConnectionPool(
     pool_name="pathwise_pool",
     pool_size=5,
@@ -20,23 +19,25 @@ db_pool = pooling.MySQLConnectionPool(
     database=os.getenv("DB_NAME", "pathwise"),
 )
 
-# 2. Lightweight In-Memory Cache for static curriculum metadata & prerequisite edges
 VLE_CACHE = {}
 PREREQ_GRAPH = {}
 MODULE_SITES = {}
 
+SERIES_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899"]
+
 
 def load_static_caches():
-    """Loads vle_materials and module_prerequisites into RAM once at startup (~5ms)."""
+    """Loads OULAD vle_materials and module_prerequisites into RAM once at startup."""
     conn = db_pool.get_connection()
     cursor = conn.cursor(dictionary=True)
 
-    cursor.execute("SELECT id_site, code_module, code_presentation, activity_type, week_from FROM vle_materials")
+    cursor.execute(
+        "SELECT id_site, code_module, code_presentation, activity_type, week_from, week_to FROM vle_materials"
+    )
     for row in cursor.fetchall():
         VLE_CACHE[row["id_site"]] = row
         MODULE_SITES.setdefault(row["code_module"], []).append(row)
 
-    # Sort each module's resources once by week_from so recommendation filtering is instant
     for mod in MODULE_SITES:
         MODULE_SITES[mod].sort(key=lambda x: (x["week_from"], x["id_site"]))
 
@@ -48,84 +49,134 @@ def load_static_caches():
     conn.close()
 
 
-def fetch_recommendations_fast(cursor, id_student, top_k=3):
-    """Combines indexed student log lookup with O(1) in-memory graph & metadata lookups."""
-    # Single indexed query for recent 20 interactions
+def get_default_student_id():
+    """Fetches a real student ID from student_vle_logs for initial page load."""
+    conn = db_pool.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id_student FROM student_vle_logs LIMIT 1")
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row[0] if row else 11391
+
+
+def build_recommendations(cursor, id_student, active_site_override=None, decay_lambda=0.03, top_k=3):
+    # Fetch real student demographic/course info from student_info
     cursor.execute(
         """
-        SELECT id_site, date_offset, decay_weight
+        SELECT id_student, code_module, code_presentation, highest_education, age_band, final_result
+        FROM student_info
+        WHERE id_student = %s
+        LIMIT 1
+        """,
+        (id_student,),
+    )
+    student_profile = cursor.fetchone()
+
+    # Fetch recent chronological clickstream from student_vle_logs
+    cursor.execute(
+        """
+        SELECT id_site, date_offset, sum_click
         FROM student_vle_logs
         WHERE id_student = %s
         ORDER BY date_offset DESC, log_id DESC
-        LIMIT 20
+        LIMIT 50
         """,
         (id_student,),
     )
     recent_rows = cursor.fetchall()
-    if not recent_rows:
-        return {"active_item": None, "shifted_focus": None, "recommendations": []}
 
-    session_queue = deque(recent_rows, maxlen=10)
-    latest_site = session_queue[0]["id_site"]
-    active_meta = VLE_CACHE.get(latest_site, {})
+    if not recent_rows:
+        return {"error": f"No OULAD interaction records found for Student ID {id_student}."}
+
+    latest_day = recent_rows[0]["date_offset"]
+    if active_site_override and active_site_override in VLE_CACHE:
+        latest_site = active_site_override
+    else:
+        latest_site = recent_rows[0]["id_site"]
+
+    active_meta = VLE_CACHE.get(latest_site)
+    if not active_meta:
+        return {"error": f"Site ID #{latest_site} does not exist in vle_materials."}
+
     visited_sites = {r["id_site"] for r in recent_rows}
 
-    # Compute current shifted activity_type preference in Python from recent decayed weights
+    # Compute live exponential time-decay weights per OULAD activity_type
     type_scores = {}
     for r in recent_rows:
         meta = VLE_CACHE.get(r["id_site"])
         if meta:
+            delta_t = max(0, latest_day - r["date_offset"])
+            w = float(r["sum_click"]) * math.exp(-decay_lambda * delta_t)
             atype = meta["activity_type"]
-            type_scores[atype] = type_scores.get(atype, 0.0) + r["decay_weight"]
+            type_scores[atype] = type_scores.get(atype, 0.0) + w
 
-    preferred_type = max(type_scores, key=type_scores.get) if type_scores else active_meta.get("activity_type", "oucontent")
+    max_type_score = max(type_scores.values()) if type_scores else 1.0
+    preferred_type = max(type_scores, key=type_scores.get) if type_scores else active_meta["activity_type"]
 
     recommendations = []
     seen = set()
 
-    # 1. Immediate next-step edges from in-memory prerequisite graph
+    # 1. Sequential Prerequisite Graph Edges (from module_prerequisites)
     for edge in PREREQ_GRAPH.get(latest_site, []):
         nxt_id = edge["next_site_id"]
         if nxt_id not in visited_sites and nxt_id not in seen and nxt_id in VLE_CACHE:
             seen.add(nxt_id)
             meta = VLE_CACHE[nxt_id]
+            type_boost = (type_scores.get(meta["activity_type"], 0.0) / max_type_score) * 0.15
+            drift_score = min(0.99, round(0.82 + type_boost, 2))
             recommendations.append({
                 "id_site": nxt_id,
+                "code_module": meta["code_module"],
                 "activity_type": meta["activity_type"],
                 "week_from": meta["week_from"],
-                "reason_tag": "Next-Step Prerequisite",
-                "explanation": edge["relation_reason"],
+                "drift_score": drift_score,
+                "source_rule": "Sequential Prerequisite Graph",
+                "why_this": edge["relation_reason"],
             })
 
-    # 2. Preference-drift matches from pre-sorted module cache
-    mod = active_meta.get("code_module")
-    curr_week = active_meta.get("week_from", 0)
+    # 2. Time-Decayed Preference Shift Candidates (from same OULAD module)
+    mod = active_meta["code_module"]
+    curr_week = active_meta["week_from"]
     candidates = [
         m for m in MODULE_SITES.get(mod, [])
         if m["week_from"] >= curr_week and m["id_site"] not in visited_sites and m["id_site"] not in seen
     ]
-    # Prioritize shifted preference type first, then chronological week
-    candidates.sort(key=lambda m: (m["activity_type"] != preferred_type, m["week_from"]))
+    candidates.sort(key=lambda m: (m["activity_type"] != preferred_type, m["week_from"], m["id_site"]))
 
-    for meta in candidates[: max(0, top_k - len(recommendations))]:
+    for idx, meta in enumerate(candidates[: max(0, top_k - len(recommendations))]):
         seen.add(meta["id_site"])
+        drift_score = round(max(0.60, 0.89 - (idx * 0.05)), 2)
         recommendations.append({
             "id_site": meta["id_site"],
+            "code_module": meta["code_module"],
             "activity_type": meta["activity_type"],
             "week_from": meta["week_from"],
-            "reason_tag": "Preference Shift Match",
-            "explanation": f"Matches your recent shift toward '{preferred_type}' in Week {meta['week_from']}",
+            "drift_score": drift_score,
+            "source_rule": "Time-Decay Preference Shift",
+            "why_this": (
+                f"Matches your highest time-decayed OULAD activity '{preferred_type}' "
+                f"(λ={decay_lambda}) scheduled for Week {meta['week_from']}"
+            ),
         })
 
     return {
-        "active_item": {**active_meta, "date_offset": session_queue[0]["date_offset"]},
-        "shifted_focus": preferred_type,
+        "student_profile": student_profile,
+        "active_session": {
+            "id_site": latest_site,
+            "code_module": active_meta["code_module"],
+            "code_presentation": active_meta["code_presentation"],
+            "activity_type": active_meta["activity_type"],
+            "week_from": active_meta["week_from"],
+            "week_to": active_meta["week_to"],
+            "latest_day": latest_day,
+            "visited_count": len(visited_sites),
+        },
         "recommendations": recommendations[:top_k],
     }
 
 
 def track_interaction(func):
-    """Logs click and decays only the student's recent active rows (fast indexed update)."""
     @wraps(func)
     def wrapper(*args, **kwargs):
         data = request.get_json(silent=True) or {}
@@ -135,7 +186,6 @@ def track_interaction(func):
         if id_student and id_site:
             conn = db_pool.get_connection()
             cursor = conn.cursor()
-            # Only decay the 30 most recent interactions instead of scanning full history
             cursor.execute(
                 """
                 UPDATE student_vle_logs
@@ -164,43 +214,67 @@ def track_interaction(func):
 
 @app.route("/")
 def index():
-    return render_template("dashboard.html")
+    default_id = get_default_student_id()
+    return render_template("dashboard.html", default_student_id=default_id)
 
 
-@app.route("/api/recommendations/<int:id_student>", methods=["GET"])
-def api_recommendations(id_student):
+@app.route("/api/sample-students", methods=["GET"])
+def api_sample_students():
+    """Returns 6 real OULAD student IDs from pathwise for quick demo switching."""
     conn = db_pool.get_connection()
     cursor = conn.cursor(dictionary=True)
-    result = fetch_recommendations_fast(cursor, id_student)
+    cursor.execute(
+        """
+        SELECT s.id_student, s.code_module, s.final_result
+        FROM student_info s
+        WHERE EXISTS (SELECT 1 FROM student_vle_logs l WHERE l.id_student = s.id_student)
+        LIMIT 6
+        """
+    )
+    rows = cursor.fetchall()
     cursor.close()
     conn.close()
-    return jsonify(result)
+    return jsonify(rows)
+
+
+@app.route("/api/recommend", methods=["GET"])
+def api_recommend():
+    id_student = request.args.get("id_student", type=int)
+    active_site = request.args.get("active_id_site", type=int)
+    decay_lambda = request.args.get("decay_weight", default=0.03, type=float)
+
+    if not id_student:
+        return jsonify({"error": "Please enter a valid OULAD Student ID."}), 400
+
+    conn = db_pool.get_connection()
+    cursor = conn.cursor(dictionary=True)
+    payload = build_recommendations(cursor, id_student, active_site, decay_lambda)
+    cursor.close()
+    conn.close()
+
+    if "error" in payload:
+        return jsonify(payload), 404
+    return jsonify(payload)
 
 
 @app.route("/api/track", methods=["POST"])
 @track_interaction
 def api_track():
-    data = request.get_json()
-    id_student = int(data["id_student"])
-    conn = db_pool.get_connection()
-    cursor = conn.cursor(dictionary=True)
-    refreshed = fetch_recommendations_fast(cursor, id_student)
-    cursor.close()
-    conn.close()
-    return jsonify({"status": "logged", "updated": refreshed})
+    return jsonify({"status": "logged"})
 
 
 @app.route("/api/analytics/<int:id_student>", methods=["GET"])
 def api_analytics(id_student):
+    decay_lambda = request.args.get("decay_weight", default=0.03, type=float)
+
     conn = db_pool.get_connection()
     cursor = conn.cursor(dictionary=True)
-    # Query only student_vle_logs (no SQL JOIN needed since VLE_CACHE is in RAM)
     cursor.execute(
         """
         SELECT FLOOR(date_offset / 7) AS study_week,
                id_site,
                SUM(sum_click) AS raw_clicks,
-               SUM(decay_weight) AS decayed_score
+               MAX(date_offset) AS latest_week_day
         FROM student_vle_logs
         WHERE id_student = %s
         GROUP BY study_week, id_site
@@ -212,21 +286,65 @@ def api_analytics(id_student):
     cursor.close()
     conn.close()
 
-    # Map id_site -> activity_type in Python memory
-    aggregated = {}
+    if not rows:
+        return jsonify({
+            "id_student": id_student,
+            "total_clicks": 0,
+            "active_weeks": 0,
+            "dominant_activity": "None",
+            "timeline": [],
+            "topic_series": [],
+        })
+
+    max_day = max(r["latest_week_day"] for r in rows)
+    weeks_set = sorted({int(r["study_week"]) for r in rows})
+    week_labels = [f"Wk {w}" for w in weeks_set]
+
+    type_week_scores = {}
+    type_totals = {}
+    total_clicks = 0
+
     for r in rows:
-        atype = VLE_CACHE.get(r["id_site"], {}).get("activity_type", "unknown")
-        key = (int(r["study_week"]), atype)
-        if key not in aggregated:
-            aggregated[key] = {"study_week": key[0], "activity_type": atype, "raw_clicks": 0, "decayed_score": 0.0}
-        aggregated[key]["raw_clicks"] += int(r["raw_clicks"])
-        aggregated[key]["decayed_score"] = round(aggregated[key]["decayed_score"] + float(r["decayed_score"]), 2)
+        total_clicks += int(r["raw_clicks"])
+        atype = VLE_CACHE.get(r["id_site"], {}).get("activity_type", "resource")
+        wk = int(r["study_week"])
+        delta_t = max(0, max_day - r["latest_week_day"])
+        decayed = float(r["raw_clicks"]) * math.exp(-decay_lambda * delta_t)
 
-    timeline = sorted(aggregated.values(), key=lambda x: (x["study_week"], x["activity_type"]))
-    return jsonify({"id_student": id_student, "timeline": timeline})
+        type_week_scores.setdefault(atype, {})
+        type_week_scores[atype][wk] = type_week_scores[atype].get(wk, 0.0) + decayed
+        type_totals[atype] = type_totals.get(atype, 0.0) + decayed
+
+    top_types = sorted(type_totals, key=type_totals.get, reverse=True)[:4]
+    dominant_activity = top_types[0] if top_types else "None"
+
+    global_peak = max(
+        (val for t in top_types for val in type_week_scores[t].values()),
+        default=1.0,
+    ) or 1.0
+
+    topic_series = []
+    for idx, atype in enumerate(top_types):
+        series_data = [
+            round(type_week_scores[atype].get(w, 0.0) / global_peak, 3)
+            for w in weeks_set
+        ]
+        topic_series.append({
+            "label": f"OULAD: {atype}",
+            "data": series_data,
+            "borderColor": SERIES_COLORS[idx % len(SERIES_COLORS)],
+        })
+
+    return jsonify({
+        "id_student": id_student,
+        "total_clicks": total_clicks,
+        "active_weeks": len(weeks_set),
+        "dominant_activity": dominant_activity,
+        "timeline": week_labels,
+        "topic_series": topic_series,
+    })
 
 
-# Warm up caches before serving requests
 load_static_caches()
 
 if __name__ == "__main__":
