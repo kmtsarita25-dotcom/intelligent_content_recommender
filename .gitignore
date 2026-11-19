@@ -3,6 +3,7 @@ cleaned/
 cleaned_data/
 data/
 *.csv
+clean/
 
 # Ignore Python environment & cache files
 __pycache__/
