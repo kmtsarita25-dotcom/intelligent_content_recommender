@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PathWise | OULAD Sequential &amp; Drift Recommendation Engine</title>
+    <title>PathWise | Personalized Study Guide</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -11,90 +11,88 @@
     <header class="topbar">
         <div class="brand">
             <h1>PathWise</h1>
-            <span class="pill-badge">OULAD Real-Data Engine</span>
+            <span class="subtitle">Adaptive Study Path</span>
         </div>
 
         <form id="student-controls" class="controls">
-            <label>
-                Sample OULAD IDs
-                <select id="sample-student-select">
-                    <option value="">-- Quick Pick --</option>
-                </select>
-            </label>
-            <label>
-                Student ID
-                <input type="number" id="student-id" value="{{ default_student_id }}" required>
-            </label>
-            <label>
-                Override Site ID (Optional)
-                <input type="number" id="active-site" placeholder="Auto (Latest)">
-            </label>
-            <label>
-                Decay (&lambda;)
-                <input type="number" id="decay-lambda" step="0.01" min="0.001" max="1" value="0.03" required>
-            </label>
-            <button type="submit" class="btn-primary">Update Feed</button>
+            <select id="sample-student-select" aria-label="Choose a sample student">
+                <option value="">Switch Student...</option>
+            </select>
+            <input type="number" id="student-id" value="{{ default_student_id }}" placeholder="Student ID" required>
+            <button type="submit" class="btn-primary">Load Path</button>
+            <button type="button" id="toggle-advanced" class="btn-ghost" title="Adjust ML parameters">Tune AI</button>
         </form>
     </header>
 
-    <main class="dashboard">
+    <!-- Collapsible ML Tuning Drawer -->
+    <div id="advanced-drawer" class="advanced-drawer hidden">
+        <div class="drawer-inner">
+            <label>
+                <span>Memory Decay (&lambda;): <strong id="lambda-display">0.10</strong></span>
+                <input type="range" id="decay-lambda" min="0.01" max="0.50" step="0.01" value="0.10">
+                <small>Higher = focuses only on very recent clicks</small>
+            </label>
+            <label>
+                <span>Jump to Specific Site ID (Optional)</span>
+                <input type="number" id="active-site" placeholder="Auto-detect latest">
+            </label>
+        </div>
+    </div>
+
+    <main class="container">
         <div id="status-banner" class="banner hidden"></div>
 
-        <!-- Real OULAD KPI Cards -->
-        <section class="kpi-row">
-            <div class="kpi-card">
-                <span class="kpi-label">OULAD Student &amp; Module</span>
-                <strong class="kpi-value" id="kpi-student">#{{ default_student_id }}</strong>
-                <span class="kpi-sub" id="kpi-profile">Loading profile...</span>
+        <!-- Compact Student Summary Strip -->
+        <section class="summary-strip">
+            <div class="student-info">
+                <span class="badge-course" id="kpi-profile">Module AAA</span>
+                <h2>Welcome back, Learner <span id="kpi-student">#{{ default_student_id }}</span></h2>
             </div>
-            <div class="kpi-card">
-                <span class="kpi-label">Total Recorded Clicks</span>
-                <strong class="kpi-value" id="kpi-clicks">--</strong>
-                <span class="kpi-sub" id="kpi-weeks">Across -- active weeks</span>
-            </div>
-            <div class="kpi-card">
-                <span class="kpi-label">Dominant Activity Type (Decayed)</span>
-                <strong class="kpi-value accent-blue" id="kpi-topic">--</strong>
-                <span class="kpi-sub">Highest w = c &middot; e<sup>-&lambda;&Delta;t</sup> weight</span>
-            </div>
-            <div class="kpi-card">
-                <span class="kpi-label">Avg Recommendation Confidence</span>
-                <strong class="kpi-value accent-green" id="kpi-score">--</strong>
-                <span class="kpi-sub">Top-3 ranked OULAD materials</span>
-            </div>
-        </section>
-
-        <!-- Two-Column Workspace: Active OULAD Session + Up Next Recommendations -->
-        <section class="main-grid">
-            <div class="panel">
-                <div class="panel-header">
-                    <h2>Latest Recorded OULAD Interaction</h2>
-                    <span class="tag-amber">Active Node</span>
+            <div class="quick-stats">
+                <div class="stat">
+                    <span class="stat-val" id="kpi-clicks">--</span>
+                    <span class="stat-lbl">Total Clicks</span>
                 </div>
-                <div id="active-session-card" class="session-box">
-                    <p class="muted">Querying student_vle_logs...</p>
+                <div class="stat">
+                    <span class="stat-val" id="kpi-topic">--</span>
+                    <span class="stat-lbl">Current Focus</span>
                 </div>
-            </div>
-
-            <div class="panel">
-                <div class="panel-header">
-                    <h2>Up Next (Sequential Graph &amp; Drift-Ranked OULAD Sites)</h2>
-                    <span class="tag-green">XAI Explained</span>
-                </div>
-                <div id="recommendations-list" class="rec-list">
-                    <p class="muted">Computing next-step recommendations...</p>
+                <div class="stat">
+                    <span class="stat-val accent" id="kpi-score">--</span>
+                    <span class="stat-lbl">Match Score</span>
                 </div>
             </div>
         </section>
 
-        <!-- Real OULAD Temporal Drift Chart -->
-        <section class="panel chart-panel">
-            <div class="panel-header">
-                <h2>OULAD Weekly Activity Drift Over Course Timeline</h2>
-                <span class="muted">Normalized Time-Decayed Interest Weight (w = c &middot; e<sup>-&lambda;&Delta;t</sup>)</span>
+        <!-- Current Activity Banner -->
+        <section class="current-card">
+            <div class="current-tag">CONTINUE WHERE YOU LEFT OFF</div>
+            <div id="active-session-card">
+                <p class="muted">Loading your last study activity...</p>
             </div>
-            <div class="chart-box">
-                <canvas id="driftChart"></canvas>
+        </section>
+
+        <!-- Main Recommendation Cards -->
+        <section class="recs-section">
+            <div class="section-head">
+                <h3>Recommended Next Steps</h3>
+                <span class="muted">Personalized from your recent study pace</span>
+            </div>
+            <div id="recommendations-list" class="rec-grid">
+                <p class="muted">Finding best next resources...</p>
+            </div>
+        </section>
+
+        <!-- Collapsible Drift Analytics Section -->
+        <section class="analytics-section">
+            <button type="button" id="toggle-chart" class="chart-toggle">
+                <span>Show Weekly Study Habit Shift (ML Drift Chart)</span>
+                <span id="chart-arrow">&#9662;</span>
+            </button>
+            <div id="chart-wrapper" class="chart-wrapper hidden">
+                <div class="chart-box">
+                    <canvas id="driftChart"></canvas>
+                </div>
             </div>
         </section>
     </main>

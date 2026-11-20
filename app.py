@@ -1,14 +1,19 @@
-import os
 import math
+import os
 from functools import wraps
+
+import pandas as pd
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 from mysql.connector import pooling
+
+from ml.recommender import generate_recommendations
 
 load_dotenv()
 
 app = Flask(__name__)
 
+# 1. Persistent MySQL Connection Pool
 db_pool = pooling.MySQLConnectionPool(
     pool_name="pathwise_pool",
     pool_size=5,
@@ -19,49 +24,82 @@ db_pool = pooling.MySQLConnectionPool(
     database=os.getenv("DB_NAME", "pathwise"),
 )
 
+# 2. In-Memory Caches for Fast ML Execution
 VLE_CACHE = {}
+VLE_DF = pd.DataFrame()
+POPULARITY_DF = pd.DataFrame()
 PREREQ_GRAPH = {}
-MODULE_SITES = {}
 
 SERIES_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899"]
 
 
 def load_static_caches():
-    """Loads OULAD vle_materials and module_prerequisites into RAM once at startup."""
+    """Load OULAD vle_materials, prerequisite edges, and baseline popularity into RAM at startup."""
+    global VLE_DF, POPULARITY_DF
+
     conn = db_pool.get_connection()
     cursor = conn.cursor(dictionary=True)
 
-    cursor.execute(
-        "SELECT id_site, code_module, code_presentation, activity_type, week_from, week_to FROM vle_materials"
-    )
-    for row in cursor.fetchall():
+    # Load all columns from vle_materials so ML feature preprocessing never misses expected fields
+    cursor.execute("SELECT * FROM vle_materials")
+    vle_rows = cursor.fetchall()
+    for row in vle_rows:
         VLE_CACHE[row["id_site"]] = row
-        MODULE_SITES.setdefault(row["code_module"], []).append(row)
 
-    for mod in MODULE_SITES:
-        MODULE_SITES[mod].sort(key=lambda x: (x["week_from"], x["id_site"]))
+    VLE_DF = pd.DataFrame(vle_rows)
+    if not VLE_DF.empty:
+        # Ensure 'is_evergreen' exists for ml/text_processor.py
+        if "is_evergreen" not in VLE_DF.columns:
+            VLE_DF["is_evergreen"] = (
+                VLE_DF["week_from"].isna() & VLE_DF["week_to"].isna()
+            ).astype(int)
+        else:
+            VLE_DF["is_evergreen"] = pd.to_numeric(
+                VLE_DF["is_evergreen"], errors="coerce"
+            ).fillna(0).astype(int)
 
-    cursor.execute("SELECT source_site_id, next_site_id, relation_reason FROM module_prerequisites")
-    for edge in cursor.fetchall():
-        PREREQ_GRAPH.setdefault(edge["source_site_id"], []).append(edge)
+    # Pre-aggregate course-level popularity from MySQL
+    cursor.execute(
+        """
+        SELECT l.id_site, v.code_module, v.code_presentation,
+               MAX(l.date_offset) AS date, SUM(l.sum_click) AS sum_click
+        FROM student_vle_logs l
+        JOIN vle_materials v ON l.id_site = v.id_site
+        GROUP BY l.id_site, v.code_module, v.code_presentation
+        """
+    )
+    pop_rows = cursor.fetchall()
+    POPULARITY_DF = pd.DataFrame(pop_rows)
+    if not POPULARITY_DF.empty:
+        POPULARITY_DF["id_student"] = -1  # Synthetic aggregate row for course popularity
+
+    # Load sequential prerequisite graph for explainability tags
+    try:
+        cursor.execute(
+            "SELECT source_site_id, next_site_id, relation_reason FROM module_prerequisites"
+        )
+        for edge in cursor.fetchall():
+            PREREQ_GRAPH.setdefault(edge["source_site_id"], []).append(edge)
+    except Exception:
+        # Keep running even if module_prerequisites table is empty or omitted
+        pass
 
     cursor.close()
     conn.close()
 
 
 def get_default_student_id():
-    """Fetches a real student ID from student_vle_logs for initial page load."""
     conn = db_pool.get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id_student FROM student_vle_logs LIMIT 1")
     row = cursor.fetchone()
     cursor.close()
     conn.close()
-    return row[0] if row else 11391
+    return row[0] if row else 24734
 
 
-def build_recommendations(cursor, id_student, active_site_override=None, decay_lambda=0.03, top_k=3):
-    # Fetch real student demographic/course info from student_info
+def build_recommendations(cursor, id_student, active_site_override=None, decay_lambda=0.1, top_k=5):
+    # 1. Fetch student profile
     cursor.execute(
         """
         SELECT id_student, code_module, code_presentation, highest_education, age_band, final_result
@@ -73,92 +111,106 @@ def build_recommendations(cursor, id_student, active_site_override=None, decay_l
     )
     student_profile = cursor.fetchone()
 
-    # Fetch recent chronological clickstream from student_vle_logs
+    # 2. Fetch student clickstream from MySQL
     cursor.execute(
         """
-        SELECT id_site, date_offset, sum_click
-        FROM student_vle_logs
-        WHERE id_student = %s
-        ORDER BY date_offset DESC, log_id DESC
-        LIMIT 50
+        SELECT l.id_student, l.id_site, l.date_offset AS date, l.sum_click,
+               v.code_module, v.code_presentation
+        FROM student_vle_logs l
+        JOIN vle_materials v ON l.id_site = v.id_site
+        WHERE l.id_student = %s
+        ORDER BY l.date_offset DESC, l.log_id DESC
         """,
         (id_student,),
     )
-    recent_rows = cursor.fetchall()
+    student_logs = cursor.fetchall()
 
-    if not recent_rows:
-        return {"error": f"No OULAD interaction records found for Student ID {id_student}."}
+    if not student_logs:
+        return {"error": f"No interaction records found for Student ID {id_student}."}
 
-    latest_day = recent_rows[0]["date_offset"]
+    # Fallback profile if student exists in logs but not in student_info
+    if not student_profile:
+        student_profile = {
+            "id_student": id_student,
+            "code_module": student_logs[0]["code_module"],
+            "code_presentation": student_logs[0]["code_presentation"],
+            "highest_education": "N/A",
+            "age_band": "N/A",
+            "final_result": "In Progress",
+        }
+
+    latest_day = student_logs[0]["date"]
     if active_site_override and active_site_override in VLE_CACHE:
         latest_site = active_site_override
     else:
-        latest_site = recent_rows[0]["id_site"]
+        latest_site = student_logs[0]["id_site"]
 
     active_meta = VLE_CACHE.get(latest_site)
     if not active_meta:
         return {"error": f"Site ID #{latest_site} does not exist in vle_materials."}
 
-    visited_sites = {r["id_site"] for r in recent_rows}
+    # 3. Combine live student logs + course popularity for the ML engine
+    student_df = pd.DataFrame(student_logs)
+    if not POPULARITY_DF.empty:
+        mod_pop_df = POPULARITY_DF[
+            (POPULARITY_DF["code_module"] == active_meta["code_module"])
+            & (POPULARITY_DF["code_presentation"] == active_meta["code_presentation"])
+        ]
+        combined_student_vle = pd.concat([student_df, mod_pop_df], ignore_index=True)
+    else:
+        combined_student_vle = student_df
 
-    # Compute live exponential time-decay weights per OULAD activity_type
-    type_scores = {}
-    for r in recent_rows:
-        meta = VLE_CACHE.get(r["id_site"])
-        if meta:
-            delta_t = max(0, latest_day - r["date_offset"])
-            w = float(r["sum_click"]) * math.exp(-decay_lambda * delta_t)
-            atype = meta["activity_type"]
-            type_scores[atype] = type_scores.get(atype, 0.0) + w
+    ml_datasets = {
+        "vle": VLE_DF,
+        "student_vle": combined_student_vle,
+    }
 
-    max_type_score = max(type_scores.values()) if type_scores else 1.0
-    preferred_type = max(type_scores, key=type_scores.get) if type_scores else active_meta["activity_type"]
+    # 4. Run ML Recommender
+    raw_ml_recs = generate_recommendations(
+        student_id=id_student,
+        datasets=ml_datasets,
+        top_n=top_k,
+        decay_rate=decay_lambda,
+        interest_weight=0.65,
+    )
 
-    recommendations = []
-    seen = set()
+    direct_next_map = {
+        edge["next_site_id"]: edge["relation_reason"]
+        for edge in PREREQ_GRAPH.get(latest_site, [])
+    }
 
-    # 1. Sequential Prerequisite Graph Edges (from module_prerequisites)
-    for edge in PREREQ_GRAPH.get(latest_site, []):
-        nxt_id = edge["next_site_id"]
-        if nxt_id not in visited_sites and nxt_id not in seen and nxt_id in VLE_CACHE:
-            seen.add(nxt_id)
-            meta = VLE_CACHE[nxt_id]
-            type_boost = (type_scores.get(meta["activity_type"], 0.0) / max_type_score) * 0.15
-            drift_score = min(0.99, round(0.82 + type_boost, 2))
-            recommendations.append({
-                "id_site": nxt_id,
-                "code_module": meta["code_module"],
-                "activity_type": meta["activity_type"],
-                "week_from": meta["week_from"],
-                "drift_score": drift_score,
-                "source_rule": "Sequential Prerequisite Graph",
-                "why_this": edge["relation_reason"],
-            })
+    # 5. Format ML results for frontend display
+    enriched_recs = []
+    for item in raw_ml_recs:
+        sid = item["id_site"]
+        meta = VLE_CACHE.get(sid, {})
+        atype = item["activity_type"]
+        wk = meta.get("week_from") if meta.get("week_from") is not None else "Any"
+        mod = meta.get("code_module", active_meta["code_module"])
+        score = round(float(item["recommendation_score"]), 3)
 
-    # 2. Time-Decayed Preference Shift Candidates (from same OULAD module)
-    mod = active_meta["code_module"]
-    curr_week = active_meta["week_from"]
-    candidates = [
-        m for m in MODULE_SITES.get(mod, [])
-        if m["week_from"] >= curr_week and m["id_site"] not in visited_sites and m["id_site"] not in seen
-    ]
-    candidates.sort(key=lambda m: (m["activity_type"] != preferred_type, m["week_from"], m["id_site"]))
+        if sid in direct_next_map:
+            rule = "ML Hybrid + Sequential Graph"
+            why = direct_next_map[sid]
+        else:
+            rule = "ML TF-IDF + Time-Decay + MMR"
+            why = (
+                f"Matched your recent {active_meta['activity_type']} interest with time-decay "
+                f"(λ={decay_lambda}) and MMR diversity (Week {wk})."
+            )
 
-    for idx, meta in enumerate(candidates[: max(0, top_k - len(recommendations))]):
-        seen.add(meta["id_site"])
-        drift_score = round(max(0.60, 0.89 - (idx * 0.05)), 2)
-        recommendations.append({
-            "id_site": meta["id_site"],
-            "code_module": meta["code_module"],
-            "activity_type": meta["activity_type"],
-            "week_from": meta["week_from"],
-            "drift_score": drift_score,
-            "source_rule": "Time-Decay Preference Shift",
-            "why_this": (
-                f"Matches your highest time-decayed OULAD activity '{preferred_type}' "
-                f"(λ={decay_lambda}) scheduled for Week {meta['week_from']}"
-            ),
+        enriched_recs.append({
+            "id_site": sid,
+            "code_module": mod,
+            "activity_type": atype,
+            "week_from": wk,
+            "recommendation_score": score,
+            "drift_score": round(min(0.99, max(0.50, score)), 2),
+            "source_rule": rule,
+            "why_this": why,
         })
+
+    visited_sites = {r["id_site"] for r in student_logs}
 
     return {
         "student_profile": student_profile,
@@ -167,12 +219,12 @@ def build_recommendations(cursor, id_student, active_site_override=None, decay_l
             "code_module": active_meta["code_module"],
             "code_presentation": active_meta["code_presentation"],
             "activity_type": active_meta["activity_type"],
-            "week_from": active_meta["week_from"],
-            "week_to": active_meta["week_to"],
+            "week_from": active_meta.get("week_from"),
+            "week_to": active_meta.get("week_to"),
             "latest_day": latest_day,
             "visited_count": len(visited_sites),
         },
-        "recommendations": recommendations[:top_k],
+        "recommendations": enriched_recs,
     }
 
 
@@ -199,7 +251,7 @@ def track_interaction(func):
             cursor.execute(
                 """
                 INSERT INTO student_vle_logs (id_student, id_site, date_offset, sum_click, decay_weight)
-                SELECT %s, %s, COALESCE(MAX(date_offset), 0) + 1, 1, 1.0
+                SELECT %s, %s, COALESCE(MAX(date_offset), 0) + 1, 5, 1.0
                 FROM student_vle_logs WHERE id_student = %s
                 """,
                 (id_student, id_site, id_student),
@@ -220,16 +272,21 @@ def index():
 
 @app.route("/api/sample-students", methods=["GET"])
 def api_sample_students():
-    """Returns 6 real OULAD student IDs from pathwise for quick demo switching."""
+    """Return active students available in student_vle_logs for quick selection/search."""
+    limit = request.args.get("limit", default=100, type=int)
     conn = db_pool.get_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute(
         """
-        SELECT s.id_student, s.code_module, s.final_result
-        FROM student_info s
-        WHERE EXISTS (SELECT 1 FROM student_vle_logs l WHERE l.id_student = s.id_student)
-        LIMIT 6
-        """
+        SELECT DISTINCT l.id_student,
+               COALESCE(s.code_module, 'OULAD') AS code_module,
+               COALESCE(s.final_result, 'Active') AS final_result
+        FROM student_vle_logs l
+        LEFT JOIN student_info s ON l.id_student = s.id_student
+        ORDER BY l.id_student ASC
+        LIMIT %s
+        """,
+        (limit,),
     )
     rows = cursor.fetchall()
     cursor.close()
@@ -241,16 +298,22 @@ def api_sample_students():
 def api_recommend():
     id_student = request.args.get("id_student", type=int)
     active_site = request.args.get("active_id_site", type=int)
-    decay_lambda = request.args.get("decay_weight", default=0.03, type=float)
+    decay_lambda = request.args.get("decay_weight", default=0.1, type=float)
 
     if not id_student:
-        return jsonify({"error": "Please enter a valid OULAD Student ID."}), 400
+        return jsonify({"error": "Please enter a valid numeric OULAD Student ID."}), 400
 
     conn = db_pool.get_connection()
     cursor = conn.cursor(dictionary=True)
-    payload = build_recommendations(cursor, id_student, active_site, decay_lambda)
-    cursor.close()
-    conn.close()
+    try:
+        payload = build_recommendations(cursor, id_student, active_site, decay_lambda)
+    except ValueError as e:
+        payload = {"error": str(e)}
+    except Exception as e:
+        payload = {"error": f"Recommendation engine error: {str(e)}"}
+    finally:
+        cursor.close()
+        conn.close()
 
     if "error" in payload:
         return jsonify(payload), 404
@@ -265,7 +328,7 @@ def api_track():
 
 @app.route("/api/analytics/<int:id_student>", methods=["GET"])
 def api_analytics(id_student):
-    decay_lambda = request.args.get("decay_weight", default=0.03, type=float)
+    decay_lambda = request.args.get("decay_weight", default=0.1, type=float)
 
     conn = db_pool.get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -308,8 +371,8 @@ def api_analytics(id_student):
         total_clicks += int(r["raw_clicks"])
         atype = VLE_CACHE.get(r["id_site"], {}).get("activity_type", "resource")
         wk = int(r["study_week"])
-        delta_t = max(0, max_day - r["latest_week_day"])
-        decayed = float(r["raw_clicks"]) * math.exp(-decay_lambda * delta_t)
+        age_in_weeks = max(0.0, (max_day - r["latest_week_day"]) / 7.0)
+        decayed = float(r["raw_clicks"]) * math.exp(-decay_lambda * age_in_weeks)
 
         type_week_scores.setdefault(atype, {})
         type_week_scores[atype][wk] = type_week_scores[atype].get(wk, 0.0) + decayed

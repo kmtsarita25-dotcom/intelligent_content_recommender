@@ -1,11 +1,28 @@
 let driftChartInstance = null;
 
+const FRIENDLY_TYPES = {
+    oucontent: "Core Course Reading",
+    quiz: "Practice Quiz",
+    forumng: "Peer Discussion Forum",
+    resource: "Study Resource / PDF",
+    url: "External Reference Link",
+    subpage: "Topic Subpage",
+    homepage: "Course Overview Hub",
+    oucollaborate: "Live Group Session",
+    glossary: "Key Terms Glossary",
+};
+
+function friendlyLabel(type) {
+    if (!type) return "Study Resource";
+    return FRIENDLY_TYPES[type] || type.toUpperCase();
+}
+
 function showBanner(message, isError = false) {
     const banner = document.getElementById("status-banner");
     banner.textContent = message;
     banner.style.borderColor = isError ? "#ef4444" : "#3b82f6";
     banner.classList.remove("hidden");
-    setTimeout(() => banner.classList.add("hidden"), 4000);
+    setTimeout(() => banner.classList.add("hidden"), 3500);
 }
 
 async function populateSampleStudents() {
@@ -14,10 +31,11 @@ async function populateSampleStudents() {
         if (!res.ok) return;
         const students = await res.json();
         const select = document.getElementById("sample-student-select");
+
         students.forEach((s) => {
             const opt = document.createElement("option");
             opt.value = s.id_student;
-            opt.textContent = `#${s.id_student} (${s.code_module} • ${s.final_result})`;
+            opt.textContent = `Student #${s.id_student} (${s.code_module})`;
             select.appendChild(opt);
         });
 
@@ -29,37 +47,16 @@ async function populateSampleStudents() {
             }
         });
     } catch (err) {
-        console.error("Failed to load sample student IDs:", err);
+        console.error("Sample load error:", err);
     }
 }
 
-async function fetchRecommendations(studentId, activeSiteId, decayWeight) {
-    const params = new URLSearchParams({
-        id_student: studentId,
-        decay_weight: decayWeight,
-    });
-    if (activeSiteId) {
-        params.set("active_id_site", activeSiteId);
+async function trackClickAndOpen(studentId, clickedItem, triggerBtn = null) {
+    if (triggerBtn) {
+        triggerBtn.disabled = true;
+        triggerBtn.textContent = "Loading...";
     }
 
-    const res = await fetch(`/api/recommend?${params.toString()}`);
-    const data = await res.json();
-    if (!res.ok) {
-        throw new Error(data.error || `HTTP ${res.status}`);
-    }
-    return data;
-}
-
-async function fetchAnalytics(studentId, decayWeight) {
-    const res = await fetch(`/api/analytics/${studentId}?decay_weight=${decayWeight}`);
-    const data = await res.json();
-    if (!res.ok) {
-        throw new Error(data.error || `HTTP ${res.status}`);
-    }
-    return data;
-}
-
-async function trackClickAndOpen(studentId, clickedItem) {
     try {
         const res = await fetch("/api/track", {
             method: "POST",
@@ -69,30 +66,48 @@ async function trackClickAndOpen(studentId, clickedItem) {
                 id_site: Number(clickedItem.id_site),
             }),
         });
-        if (!res.ok) throw new Error("Failed to write click to MySQL");
+        if (!res.ok) throw new Error("Could not save activity");
     } catch (err) {
-        showBanner(`Database error logging click: ${err.message}`, true);
+        showBanner(err.message, true);
+        if (triggerBtn) {
+            triggerBtn.disabled = false;
+            triggerBtn.innerHTML = "Continue Studying &rarr;";
+        }
         return;
     }
 
     document.getElementById("active-site").value = clickedItem.id_site;
-    showBanner(`Logged real click on OULAD Site #${clickedItem.id_site} (${clickedItem.activity_type}) — recalculating drift...`);
+    showBanner(`Opened ${friendlyLabel(clickedItem.activity_type)} (Site #${clickedItem.id_site}) — updating next steps...`);
     await loadDashboard();
 }
 
 function renderActiveSession(session, profile) {
     const container = document.getElementById("active-session-card");
-    const modInfo = profile
-        ? `Module ${profile.code_module} (${profile.code_presentation}) &bull; Result: ${profile.final_result}`
-        : `Module ${session.code_module} (${session.code_presentation})`;
+    const studentId = document.getElementById("student-id").value;
+    const modText = profile
+        ? `Module ${profile.code_module} (${profile.code_presentation})`
+        : `Module ${session.code_module}`;
 
-    document.getElementById("kpi-profile").innerHTML = modInfo;
+    document.getElementById("kpi-profile").textContent = modText;
+
+    const weekDisplay = session.week_from !== null && session.week_from !== undefined
+        ? `Week ${session.week_from}`
+        : "General Schedule";
 
     container.innerHTML = `
-        <h3>OULAD Site #${session.id_site} &mdash; ${session.activity_type.toUpperCase()}</h3>
-        <p class="rec-meta">Module: <strong>${session.code_module}</strong> &bull; Scheduled: <strong>Week ${session.week_from} to Week ${session.week_to}</strong></p>
-        <p class="muted">Last recorded click on course day <strong>${session.latest_day}</strong> (${session.visited_count} distinct materials visited in recent window).</p>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap;">
+            <div>
+                <h3>${friendlyLabel(session.activity_type)} <span class="muted">(Site #${session.id_site})</span></h3>
+                <p class="muted">${weekDisplay} &bull; ${session.visited_count} materials explored so far</p>
+            </div>
+            <button type="button" id="continue-active-btn" class="launch-btn">Continue Studying &rarr;</button>
+        </div>
     `;
+
+    const continueBtn = document.getElementById("continue-active-btn");
+    continueBtn.addEventListener("click", () => {
+        trackClickAndOpen(studentId, session, continueBtn);
+    });
 }
 
 function renderRecommendations(studentId, recs) {
@@ -100,7 +115,7 @@ function renderRecommendations(studentId, recs) {
     list.innerHTML = "";
 
     if (!recs || recs.length === 0) {
-        list.innerHTML = `<p class="muted">No remaining unvisited OULAD materials found after this week.</p>`;
+        list.innerHTML = `<p class="muted">You're all caught up on this module!</p>`;
         document.getElementById("kpi-score").textContent = "--";
         return;
     }
@@ -108,76 +123,59 @@ function renderRecommendations(studentId, recs) {
     let totalScore = 0;
 
     recs.forEach((item) => {
-        const score = Number(item.drift_score || 0);
+        const score = Number(item.drift_score || item.recommendation_score || 0);
         totalScore += score;
 
         const card = document.createElement("div");
         card.className = "rec-card";
         card.innerHTML = `
             <div>
-                <strong>OULAD Site #${item.id_site} (${item.activity_type.toUpperCase()})</strong>
-                <div class="rec-meta">
-                    Module: ${item.code_module} &bull; Week ${item.week_from} &bull; Engine: ${item.source_rule} &bull; Score: <strong>${score.toFixed(2)}</strong>
-                </div>
-                <span class="why-tag">Why this? ${item.why_this}</span>
+                <div class="rec-title">${friendlyLabel(item.activity_type)} <span class="muted">&bull; Site #${item.id_site}</span></div>
+                <div class="rec-meta">Module ${item.code_module} &bull; Week ${item.week_from ?? "Any"} &bull; ${Math.round(score * 100)}% Match</div>
+                <span class="why-pill">${item.why_this}</span>
             </div>
-            <button type="button" class="launch-btn">Study Next &rarr;</button>
+            <button type="button" class="launch-btn">Start Studying &rarr;</button>
         `;
 
-        card.querySelector(".launch-btn").addEventListener("click", () => {
-            trackClickAndOpen(studentId, item);
+        const btn = card.querySelector(".launch-btn");
+        btn.addEventListener("click", () => {
+            trackClickAndOpen(studentId, item, btn);
         });
 
         list.appendChild(card);
     });
 
-    document.getElementById("kpi-score").textContent = (totalScore / recs.length).toFixed(2);
+    document.getElementById("kpi-score").textContent = `${Math.round((totalScore / recs.length) * 100)}%`;
 }
 
 function renderDriftChart(analytics) {
     const ctx = document.getElementById("driftChart").getContext("2d");
-
-    if (driftChartInstance) {
-        driftChartInstance.destroy();
-    }
+    if (driftChartInstance) driftChartInstance.destroy();
 
     const datasets = (analytics.topic_series || []).map((series) => ({
-        label: series.label,
+        label: series.label.replace("OULAD: ", ""),
         data: series.data,
         borderColor: series.borderColor || "#3b82f6",
         backgroundColor: "transparent",
         tension: 0.35,
-        borderWidth: 2.5,
-        pointRadius: 3.5,
+        borderWidth: 2,
+        pointRadius: 3,
     }));
 
     driftChartInstance = new Chart(ctx, {
         type: "line",
-        data: {
-            labels: analytics.timeline || [],
-            datasets,
-        },
+        data: { labels: analytics.timeline || [], datasets },
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            plugins: {
-                legend: { labels: { color: "#f8fafc" } },
-            },
+            plugins: { legend: { labels: { color: "#e2e8f0" } } },
             scales: {
-                x: {
-                    ticks: { color: "#94a3b8" },
-                    grid: { color: "#1e293b" },
-                },
+                x: { ticks: { color: "#94a3b8" }, grid: { color: "#334155" } },
                 y: {
                     min: 0,
                     max: 1,
-                    title: {
-                        display: true,
-                        text: "Normalized Time-Decayed Click Weight",
-                        color: "#94a3b8",
-                    },
                     ticks: { color: "#94a3b8" },
-                    grid: { color: "#1e293b" },
+                    grid: { color: "#334155" },
                 },
             },
         },
@@ -191,32 +189,51 @@ async function loadDashboard() {
 
     document.getElementById("kpi-student").textContent = `#${studentId}`;
 
+    const params = new URLSearchParams({ id_student: studentId, decay_weight: decayWeight });
+    if (activeSiteId) params.set("active_id_site", activeSiteId);
+
     try {
-        const [recPayload, analyticsPayload] = await Promise.all([
-            fetchRecommendations(studentId, activeSiteId, decayWeight),
-            fetchAnalytics(studentId, decayWeight),
+        const [recRes, anaRes] = await Promise.all([
+            fetch(`/api/recommend?${params.toString()}`),
+            fetch(`/api/analytics/${studentId}?decay_weight=${decayWeight}`),
         ]);
+
+        const recPayload = await recRes.json();
+        const analyticsPayload = await anaRes.json();
+
+        if (!recRes.ok) throw new Error(recPayload.error || "Unable to load student path");
 
         renderActiveSession(recPayload.active_session, recPayload.student_profile);
         renderRecommendations(studentId, recPayload.recommendations);
 
         document.getElementById("kpi-clicks").textContent = (analyticsPayload.total_clicks ?? 0).toLocaleString();
-        document.getElementById("kpi-weeks").textContent = `Across ${analyticsPayload.active_weeks ?? 0} active study weeks`;
-        document.getElementById("kpi-topic").textContent = (analyticsPayload.dominant_activity || "--").toUpperCase();
+        document.getElementById("kpi-topic").textContent = friendlyLabel(analyticsPayload.dominant_activity || "oucontent");
 
         renderDriftChart(analyticsPayload);
     } catch (err) {
         showBanner(err.message, true);
-        document.getElementById("active-session-card").innerHTML = `<p class="muted">${err.message}</p>`;
-        document.getElementById("recommendations-list").innerHTML = "";
-        document.getElementById("kpi-clicks").textContent = "--";
-        document.getElementById("kpi-topic").textContent = "--";
-        document.getElementById("kpi-score").textContent = "--";
     }
 }
 
+// UI Toggles
+document.getElementById("toggle-advanced").addEventListener("click", () => {
+    document.getElementById("advanced-drawer").classList.toggle("hidden");
+});
+
+document.getElementById("decay-lambda").addEventListener("input", (e) => {
+    document.getElementById("lambda-display").textContent = Number(e.target.value).toFixed(2);
+});
+
+document.getElementById("toggle-chart").addEventListener("click", () => {
+    const wrapper = document.getElementById("chart-wrapper");
+    const arrow = document.getElementById("chart-arrow");
+    wrapper.classList.toggle("hidden");
+    arrow.innerHTML = wrapper.classList.contains("hidden") ? "&#9662;" : "&#9652;";
+});
+
 document.getElementById("student-controls").addEventListener("submit", async (e) => {
     e.preventDefault();
+    document.getElementById("active-site").value = "";
     await loadDashboard();
 });
 
